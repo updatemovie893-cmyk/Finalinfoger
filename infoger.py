@@ -11,7 +11,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 from datetime import datetime, timedelta
 
 # ---------- Configuration ----------
-BOT_TOKEN   = os.environ.get("8356857320:AAGARzzapb6gYss0J_wtKHbEZ39RWXZnZPM", "")
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS   = {"1838854178", "1930138915"}
 _replit_domain = os.environ.get("REPLIT_DEV_DOMAIN", "")
 BASE_URL    = f"https://{_replit_domain}" if _replit_domain else "https://your-app.replit.dev"
