@@ -13,8 +13,11 @@ from datetime import datetime, timedelta
 # ---------- Configuration ----------
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS   = {"1838854178", "1930138915"}
-_replit_domain = os.environ.get("REPLIT_DEV_DOMAIN", "")
-BASE_URL    = f"https://{_replit_domain}" if _replit_domain else "https://your-app.replit.dev"
+# Get the public URL from Render environment or set manually
+BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+if not BASE_URL:
+    # If not on Render (or variable missing), use a default
+    BASE_URL = os.environ.get("BASE_URL", "https://finalinfoger.onrender.com")
 
 tracking_links = {}   # token -> user_id
 seen_users     = set()
