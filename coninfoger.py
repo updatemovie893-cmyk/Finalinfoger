@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 
 # ---------- Configuration ----------
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS   = {"1838854178", "1930138915"}
 # Get the public URL from Render environment or set manually
 BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
