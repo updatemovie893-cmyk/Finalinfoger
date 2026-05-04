@@ -8,7 +8,7 @@ from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # ------------------- CONFIG -------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8783637703:AAEPEjD9tq-Ncfa1TsUy9s2skgN8KplNTQE")
 
 admin_ids_str = os.environ.get("ADMIN_IDS", "1930138915")
 ADMINS = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip().isdigit()]
