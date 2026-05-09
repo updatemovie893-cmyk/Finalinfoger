@@ -1,9 +1,11 @@
 import json
 import os
 import random
-import requests
+import aiohttp
+import uuid
+import asyncio
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
@@ -25,6 +27,11 @@ REFERRAL_BONUS = 2.0
 LOOKUP_COST = 1.0
 DAILY_BONUS_AMOUNT = 2.0
 
+# Additional constants / new lookup APIs
+LOOKUP_API_1 = "https://tgchatid.vercel.app/api/lookup?number="
+LOOKUP_API_2 = "https://tg-to-num-vishal.vercel.app/api/search?number="
+VERIFY_AFTER_LOOKUPS = 3
+
 EFFECTS = [
     {"emoji": "🔥", "text": "Kbz Payလည်းရ"},
     {"emoji": "👍", "text": "Wave Payလည်းရ"},
@@ -39,24 +46,42 @@ def get_random_effect():
 
 # ------------------- DATA MANAGEMENT -------------------
 def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
+    try:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        # corrupted file or read error -> return empty
+        return {}
     return {}
 
 def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    try:
+        tmp = DATA_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, DATA_FILE)
+    except Exception:
+        # best-effort; in production replace with DB
+        pass
 
 def load_promos():
-    if os.path.exists(PROMO_FILE):
-        with open(PROMO_FILE, "r") as f:
-            return json.load(f)
+    try:
+        if os.path.exists(PROMO_FILE):
+            with open(PROMO_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        return {}
     return {}
 
 def save_promos(promos):
-    with open(PROMO_FILE, "w") as f:
-        json.dump(promos, f, indent=2)
+    try:
+        tmp = PROMO_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(promos, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, PROMO_FILE)
+    except Exception:
+        pass
 
 def get_user(user_id):
     data = load_data()
@@ -117,7 +142,8 @@ async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str):
         try:
             await context.bot.send_message(chat_id=admin_id, text=text)
         except Exception as e:
-            print(f"Failed to notify admin {admin_id}: {e}")
+            # keep going; logging could be added
+            pass
 
 # ------------------- REPLY KEYBOARD -------------------
 def get_main_keyboard(user_id=None):
@@ -129,6 +155,14 @@ def get_main_keyboard(user_id=None):
     if user_id in ADMINS:
         buttons.append(["👑 Admin Panel"])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
+
+# New: lookup keyboard
+def get_lookup_keyboard():
+    keyboard = [
+        [KeyboardButton("🎯 Target")],
+        ["🔙 Back to Menu"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message_text=None):
     user_id = update.effective_user.id
@@ -144,16 +178,19 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_claim = user_data.get("daily_last_claim")
     
     if last_claim:
-        last_date = datetime.fromisoformat(last_claim)
-        if datetime.now() - last_date < timedelta(hours=24):
-            remaining = timedelta(hours=24) - (datetime.now() - last_date)
-            hours = int(remaining.total_seconds() // 3600)
-            minutes = int((remaining.total_seconds() % 3600) // 60)
-            await update.message.reply_text(
-                f"⏳ You already claimed daily bonus.\nCome back after {hours}h {minutes}m.",
-                reply_markup=get_main_keyboard(user_id)
-            )
-            return
+        try:
+            last_date = datetime.fromisoformat(last_claim)
+            if datetime.now() - last_date < timedelta(hours=24):
+                remaining = timedelta(hours=24) - (datetime.now() - last_date)
+                hours = int(remaining.total_seconds() // 3600)
+                minutes = int((remaining.total_seconds() % 3600) // 60)
+                await update.message.reply_text(
+                    f"⏳ You already claimed daily bonus.\nCome back after {hours}h {minutes}m.",
+                    reply_markup=get_main_keyboard(user_id)
+                )
+                return
+        except Exception:
+            pass
     
     new_balance = add_points(user_id, DAILY_BONUS_AMOUNT)
     update_user(user_id, "daily_last_claim", datetime.now().isoformat())
@@ -225,47 +262,168 @@ async def statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_main_keyboard(user_id))
 
-# ------------------- LOOKUP WITH TARGET BUTTON -------------------
-# We'll use context.user_data for temporary state: "awaiting_target" = True
+# ------------------- LOOKUP (aiohttp) -------------------
+# Helper function to clean phone number
+def clean_number(s: str) -> str:
+    return ''.join(filter(str.isdigit, s))
 
-async def lookup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show the Target button."""
+async def perform_lookup_by_phone(update: Update, context: ContextTypes.DEFAULT_TYPE, phone_input: str, user_id: int = None):
+    """
+    Perform lookup using a phone number. Uses aiohttp to call two lookup APIs in parallel.
+    Falls back to refunding points on failure.
+    """
+    if user_id is None:
+        user_id = update.effective_user.id
+    telegram_id = user_id
+    chat_id = update.effective_chat.id
+    number = clean_number(phone_input)
+
+    if len(number) < 7:
+        await update.message.reply_text("❌ Invalid phone number (min 7 digits).", reply_markup=get_main_keyboard(user_id))
+        return
+
+    # Check balance and verification
+    u = get_user(user_id)
+    if not u or u.get("balance", 0) < LOOKUP_COST:
+        await update.message.reply_text(f"Insufficient balance. Need {LOOKUP_COST} pts.", reply_markup=get_main_keyboard(user_id))
+        return
+
+    if u.get("lookups_count", 0) >= VERIFY_AFTER_LOOKUPS and not u.get("phone_number"):
+        # ask for contact (best-effort)
+        await update.message.reply_text("📱 Phone verification required. Please share your contact.", reply_markup=get_main_keyboard(user_id))
+        return
+
+    status_msg = await update.message.reply_text("🔍 Looking up phone number...")
+
+    # Deduct point first (optimistic), will refund on failure
+    if not deduct_points(user_id, LOOKUP_COST):
+        await status_msg.edit_text("❌ Balance insufficient.")
+        return
+
+    # Call both APIs in parallel
+    data1 = data2 = None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async def get_json(url):
+                try:
+                    async with session.get(url, timeout=10) as resp:
+                        if resp.status == 200:
+                            return await resp.json()
+                except Exception:
+                    return None
+                return None
+
+            task1 = asyncio.create_task(get_json(f"{LOOKUP_API_1}{number}"))
+            task2 = asyncio.create_task(get_json(f"{LOOKUP_API_2}{number}"))
+            data1, data2 = await asyncio.gather(task1, task2)
+    except Exception:
+        data1 = data2 = None
+
+    found1 = bool(data1 and data1.get("success") and data1.get("data"))
+    found2 = bool(data2 and (data2.get("success") or data2.get("found")) and data2.get("chat_id"))
+
+    if not found1 and not found2:
+        # refund
+        add_points(user_id, LOOKUP_COST)
+        await status_msg.edit_text(f"❌ No data found for `{phone_input}`", parse_mode="Markdown")
+        return
+
+    # update lookup stats
+    increment_lookup_count(user_id)
+
+    # Build response
+    lines = ["📱 *Lookup Result*", ""]
+    phone_result = number
+    country = ""
+    country_code = ""
+    chat_id_found = ""
+    username_found = ""
+    name_found = ""
+
+    if found1:
+        d = data1.get("data", {})
+        phone_result = d.get("number", number)
+        country = d.get("country", "")
+        country_code = d.get("country_code", "")
+        chat_id_found = d.get("chat_id", "")
+        username_found = d.get("Username", "")
+        if country:
+            lines.append(f"🌍 *Country:* {country}")
+        if country_code:
+            lines.append(f"📞 *Country Code:* +{country_code}")
+        if chat_id_found:
+            lines.append(f"🆔 *Chat ID:* `{chat_id_found}`")
+        if username_found:
+            lines.append(f"💌 *Username:* @{username_found}")
+
+    if found2:
+        d = data2 if isinstance(data2, dict) else {}
+        if not found1:
+            phone_result = d.get("phone", number)
+        if d.get("username"):
+            if not username_found:
+                username_found = d.get("username")
+            lines.append(f"💌 *Username:* @{d['username']}")
+        if d.get("first_name") or d.get("last_name"):
+            name_found = f"{d.get('first_name','')} {d.get('last_name','')}".strip()
+            lines.append(f"👤 *Name:* {name_found}")
+        if d.get("chat_id") and not chat_id_found:
+            chat_id_found = d.get("chat_id")
+            lines.append(f"🆔 *Chat ID:* `{chat_id_found}`")
+
+    new_balance = get_user(user_id).get("balance", 0)
+    lines.append(f"\n✅ *-{int(LOOKUP_COST)} pt* | 💎 New balance: {new_balance} pts")
+
+    await status_msg.edit_text("\n".join(lines), parse_mode="Markdown")
+
+    # Ask for consent to share
+    share_data = f"share:lookup:{phone_result}|{chat_id_found}|{username_found}|{country}|{country_code}"
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎯 Target", callback_data="target_lookup")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_lookup")]
+        [InlineKeyboardButton("📤 Share with Admin", callback_data=share_data)]
     ])
-    await update.message.reply_text(
-        "📱 <b>Choose an option:</b>",
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
+    await update.message.reply_text("Do you want to share this result with admins? (You'll get +1 pt)", reply_markup=keyboard)
 
-async def target_lookup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User pressed Target -> set state and show prompt."""
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    context.user_data["awaiting_target"] = True  # state flag
-    await query.edit_message_text(
-        "🔍 <b>LOOKUP DATABASE</b>\n\n"
-        "Tap the Target button below to share a user, or send the User ID directly in chat.\n\n"
-        "👉 Forward a message from the target user (any message they sent), or type their numeric User ID.\n"
-        "Each lookup costs 1 point.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_lookup")]
-        ])
-    )
+    # Save lookup history (best-effort to DATA_FILE)
+    try:
+        data = load_data()
+        history = data.get("history", [])
+        history_entry = {
+            "id": str(uuid.uuid4()),
+            "telegram_id": str(user_id),
+            "query": number,
+            "result_phone": phone_result,
+            "result_chat_id": chat_id_found or None,
+            "result_username": username_found or None,
+            "result_country": country or None,
+            "found": "yes"
+        }
+        history.append(history_entry)
+        data["history"] = history
+        save_data(data)
+    except Exception:
+        pass
 
-async def cancel_lookup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    context.user_data.pop("awaiting_target", None)
-    await query.edit_message_text("❌ Lookup cancelled.", reply_markup=get_main_keyboard(user_id))
+    # Fire alerts (placeholder: notify admins or interested parties) - simple implementation
+    try:
+        for admin in ADMINS:
+            try:
+                await context.bot.send_message(admin, f"Lookup: {user_id} -> {phone_result} (found)")
+            except Exception:
+                pass
+    except Exception:
+        pass
 
+# ------------------- ORIGINAL LOOKUP FLOW (kept for UIDs) -------------------
 async def perform_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id_str: str, user_id: int):
-    """Core lookup logic: deduct points, call API, show result."""
+    """Core lookup logic: deduct points, call API, show result. Supports numeric user IDs (old flow).
+    If a phone-like input is provided (contains non-digit or long number), forwards to perform_lookup_by_phone.
+    """
+    # If looks like a phone number (has + or length >=7 but not pure uid), delegate
+    if not target_id_str.isdigit() or len(target_id_str) >= 7:
+        await perform_lookup_by_phone(update, context, target_id_str, user_id)
+        return
+
+    # Existing numeric-ID lookup (keeps prior behaviour)
     if not target_id_str.isdigit():
         await update.message.reply_text("❌ Invalid user ID. Please send only numbers.", reply_markup=get_main_keyboard(user_id))
         return False
@@ -275,10 +433,11 @@ async def perform_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
         return False
     
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    
     try:
-        url = f"{API_URL}?number={target_id_str}"
-        resp = requests.get(url, timeout=10)
+        # Keep using requests for UID-based API (legacy) but run in thread to avoid blocking
+        import requests
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(None, requests.get, f"{API_URL}?number={target_id_str}")
         data = resp.json()
         if data.get("success") and data.get("data"):
             info = data["data"]
@@ -327,6 +486,7 @@ async def referral_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=inline_keyboard)
 
+# ------------------- SHARE REF CALLBACK (fixed truncated text) -------------------
 async def share_referral_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -335,7 +495,7 @@ async def share_referral_callback(update: Update, context: ContextTypes.DEFAULT_
         owner_id = int(data.split("_")[2])
         invite_link = f"https://t.me/{context.bot.username}?start=ref_{owner_id}"
         await query.edit_message_text(
-            text=f"🔗 <b>Your referral link to share:</b>\n\n{invite_link}\n\n<i>Forward this message to your friend or tap the link to copy it.</i>\n\nAfter your friend starts the bot, you will get {REFERRAL_BONUS} points!",
+            text=f"🔗 <b>Your referral link to share:</b>\n\n{invite_link}\n\n<i>Forward this message to your friend or tap the link to copy it.</i>\n\nAfter your friend starts the bot, you will receive the referral bonus.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📤 Forward this message", switch_inline_query="")],
@@ -373,7 +533,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     update_user(referrer_id, "referrals", get_user(referrer_id)["referrals"] + 1)
                     update_user(user_id, "referred_by", referrer_id)
                     msg = f"🎉 New user joined via your link!\n➕ +{REFERRAL_BONUS} points.\n💰 New balance: {get_user(referrer_id)['balance']:.1f} pts"
-                    await context.bot.send_message(chat_id=referrer_id, text=msg)
+                    try:
+                        await context.bot.send_message(chat_id=referrer_id, text=msg)
+                    except Exception:
+                        pass
                     await notify_admins(context, f"✅ Referral used: {referrer_id} referred {user_id}")
     
     user_data = get_user(user_id)
@@ -545,7 +708,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await balance(update, context)
         return
     elif text == "🔍 Lookup Number":
-        await lookup_start(update, context)
+        # Use new lookup menu
+        await handle_lookup_menu(update, context)
         return
     elif text == "📊 Statistics":
         await statistics(update, context)
@@ -574,14 +738,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.forward_from:
             target_id = update.message.forward_from.id
             await perform_lookup(update, context, str(target_id), user_id)
-        elif text.isdigit():
+        elif text:
+            # treat as phone or uid
             await perform_lookup(update, context, text, user_id)
         else:
-            await update.message.reply_text("❌ Please forward a message from the user OR send a numeric User ID.", reply_markup=get_main_keyboard(user_id))
+            await update.message.reply_text("❌ Please forward a message from the user OR send a numeric User ID or phone number.", reply_markup=get_main_keyboard(user_id))
         return
     
     # Fallback
     await update.message.reply_text("Please use the buttons from the menu.", reply_markup=get_main_keyboard(user_id))
+
+# ------------------- HANDLER FOR LOOKUP MENU -------------------
+async def handle_lookup_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    u = get_user(user_id)
+    if not u or u.get("balance", 0) < LOOKUP_COST:
+        await update.message.reply_text(f"Insufficient balance. Need {LOOKUP_COST} pts.", reply_markup=get_main_keyboard(user_id))
+        return
+    if u.get("lookups_count", 0) >= VERIFY_AFTER_LOOKUPS and not u.get("phone_number"):
+        await update.message.reply_text("📱 Please verify your phone number first by sharing contact.", reply_markup=get_main_keyboard(user_id))
+        return
+
+    context.user_data["awaiting_target"] = True
+    await update.message.reply_text(
+        f"📞 Send a phone number (with country code if possible).\nCost: {int(LOOKUP_COST)} pt.\nOr tap 🎯 Target to choose a user.",
+        reply_markup=get_lookup_keyboard()
+    )
+
+# ------------------- FIRE ALERTS (placeholder) -------------------
+async def fire_alert_notifications(number: str, finder_id: str, source_label: str):
+    cleaned = clean_number(number)
+    # Placeholder: would normally notify users that registered alerts for this number
+    # For now, send to admins only (best-effort)
+    for admin in ADMINS:
+        try:
+            # NOTE: context is not available here; in real flow pass context
+            pass
+        except Exception:
+            pass
 
 # ------------------- MAIN -------------------
 def main():
